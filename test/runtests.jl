@@ -1,0 +1,453 @@
+using PlautBeamFiniteElement
+using Test
+using LinearAlgebra
+
+# ==================================================================
+# Reference data from Plaut & Moen (2021), JCSR 179, 106534
+# Units: N, mm (1 kN/m = 1 N/mm; E = 200 kN/mm² = 200e3 N/mm²)
+# ==================================================================
+
+const L = 7620.0
+const mat = Material(E = 200e3)          # G = E/2.6, Section 3
+
+# Example 1: 9CS2.5×059 C-section (Section 3)
+const sec1 = Section(Ix = 4.287e6, Iy = 290500.0, Ixy = 0.0,
+                     J = 424.56, Cw = 3.1956e9, ax = 57.67, ay = 114.3)
+
+# Example 2: 8ZS2.25×059 Z-section (Section 4; Ixy negative with y downward)
+const sec2 = Section(Ix = 3.230e6, Iy = 449530.0, Ixy = -865760.0,
+                     J = 397.09, Cw = 3.4104e9, ax = 27.826, ay = 101.6)
+
+"""
+Exact Fourier sine-series solution of Eqs. (2)-(4) for a pinned-pinned beam
+(u = u'' = v = v'' = ϕ = ϕ'' = 0 at both ends). With constant coefficients the
+equations decouple mode by mode: substituting (u, v, ϕ) = Σ (uₙ, vₙ, ϕₙ) sin(λₙ z),
+λₙ = nπ/L, and expanding the uniform load, 1 = Σ (4/nπ) sin(λₙ z) over odd n,
+gives a 3×3 linear system per mode.
+"""
+function series_solution(z; L, section, material, restraint, q, θ = 0.0, nmodes = 399)
+    (; E, G) = material
+    (; Ix, Iy, Ixy, J, Cw, ax, ay) = section
+    (; kx, kϕ) = restraint
+    qx, qy = -q * sin(θ), q * cos(θ)                       # Eq. (1)
+    u = v = ϕ = 0.0
+    for n in 1:2:nmodes
+        λ, c = n * π / L, 4 / (n * π)
+        A = [E*Iy*λ^4 + kx    E*Ixy*λ^4      kx*ay
+             E*Ixy*λ^4        E*Ix*λ^4       0.0
+             kx*ay            0.0            E*Cw*λ^4 + G*J*λ^2 + kx*ay^2 + kϕ + qx*ax - qy*ay]
+        x = A \ (c .* [qx, qy, qx*ay + qy*ax])
+        s = sin(λ * z)
+        u += x[1] * s; v += x[2] * s; ϕ += x[3] * s
+    end
+    return (u = u, v = v, ϕ = ϕ)
+end
+
+model1(; kwargs...) = BeamModel(; L, nel = 40, section = sec1, material = mat, kwargs...)
+model2(; kwargs...) = BeamModel(; L, nel = 40, section = sec2, material = mat, kwargs...)
+
+peak_abs_twist(sol; npts = 401) = maximum(abs, twist.(Ref(sol), range(0, sol.model.L, npts)))
+
+# ==================================================================
+
+@testset "PlautBeamFiniteElement" begin
+
+@testset "stiffness matrix properties" begin
+    m = model1(q = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1000.0))
+    Ke = elastic_stiffness(m)
+    Kg = geometric_stiffness(m)
+    @test Ke ≈ Ke'                       # symmetric
+    @test Kg ≈ Kg'
+    free = setdiff(1:size(Ke, 1), constrained_dofs(m))
+    @test isposdef(Symmetric(Ke[free, free]))
+    # gravity load above the shear center softens the ϕϕ block (qx ax - qy ay < 0);
+    # Kg is negative semi-definite (zero rows/columns for the u and v DOFs)
+    λmin = eigmin(Symmetric(Kg[free, free]))
+    @test λmin < 0
+    @test eigmax(Symmetric(Kg[free, free])) <= 1e-9 * abs(λmin)
+    # uplift stiffens it (positive semi-definite up to round-off)
+    Kg_up = geometric_stiffness(model1(q = -1.0))
+    @test eigmin(Symmetric(Kg_up[free, free])) >= -1e-9 * eigmax(Symmetric(Kg_up[free, free]))
+    # geometric stiffness vanishes without load
+    @test iszero(geometric_stiffness(model1(q = 0.0)))
+end
+
+@testset "vertical bending benchmarks (Eq. 3, C-section: v uncoupled)" begin
+    q = 1.0
+    EIx = mat.E * sec1.Ix
+    # pinned-pinned: v_max = 5qL⁴/(384 EIx), exact at nodes for Hermite elements
+    sol = solve_beam(model1(q = q))
+    @test vertical_deflection(sol, L / 2) ≈ 5q * L^4 / (384EIx) rtol = 1e-9
+    # fixed-fixed: v_max = qL⁴/(384 EIx)
+    sol = solve_beam(model1(q = q, bc_left = :fixed, bc_right = :fixed))
+    @test vertical_deflection(sol, L / 2) ≈ q * L^4 / (384EIx) rtol = 1e-9
+    # pinned-fixed: v(L/2) = qL⁴/(192 EIx)
+    sol = solve_beam(model1(q = q, bc_right = :fixed))
+    @test vertical_deflection(sol, L / 2) ≈ q * L^4 / (192EIx) rtol = 1e-9
+    # v is independent of the twist/lateral problem for the C-section (Ixy = 0)
+    solr = solve_beam(model1(q = q, restraint = Restraint(kx = 0.1, kϕ = 1000.0)))
+    @test vertical_deflection(solr, L / 2) ≈ 5q * L^4 / (384EIx) rtol = 1e-9
+end
+
+@testset "Example 1 (C-section) vs exact series, pinned-pinned" begin
+    cases = [
+        (restraint = Restraint(),                          q =  0.05, θ = 0.0),  # Figs. 3/8 lowest curves
+        (restraint = Restraint(kϕ = 500.0),                q =  1.0,  θ = 0.0),  # Fig. 3
+        (restraint = Restraint(kϕ = 500.0),                q = -1.0,  θ = 0.0),  # Fig. 4
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  1.0,  θ = 0.0),  # Fig. 7
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q = -1.0,  θ = 0.0),  # Fig. 7
+        (restraint = Restraint(kx = 0.01, kϕ = 0.0),       q =  0.3,  θ = 0.0),  # Fig. 8
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  1.0,  θ = 0.083),   # Fig. 18, 1:12 upslope
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  1.0,  θ = -0.083),  # downslope
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  2.0,  θ = 0.46),    # Fig. 17, 6:12 pitch
+    ]
+    for c in cases
+        sol = solve_beam(model1(q = c.q, θ = c.θ, restraint = c.restraint))
+        for z in (0.25L, 0.42L, 0.5L)
+            ref = series_solution(z; L, section = sec1, material = mat,
+                                  restraint = c.restraint, q = c.q, θ = c.θ)
+            @test twist(sol, z) ≈ ref.ϕ rtol = 1e-4
+            @test lateral_deflection(sol, z) ≈ ref.u rtol = 1e-4 atol = 1e-10
+            @test vertical_deflection(sol, z) ≈ ref.v rtol = 1e-4
+        end
+    end
+end
+
+@testset "Example 1 magnitudes match Fig. 7 (kx=0.1, kϕ=1000, q=±1)" begin
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    solg = solve_beam(model1(q = 1.0, restraint = r))
+    solu = solve_beam(model1(q = -1.0, restraint = r))
+    # Fig. 7: gravity twist peaks ≈ +0.075 rad at midspan, uplift ≈ -0.055 rad;
+    # gravity twist magnitude exceeds uplift
+    @test 0.06 < twist(solg, L / 2) < 0.09
+    @test -0.075 < twist(solu, L / 2) < -0.05
+    @test twist(solg, L / 2) > abs(twist(solu, L / 2))
+    # Section 6: C-section lateral deflection is negative for gravity, positive for uplift
+    @test lateral_deflection(solg, L / 2) < 0
+    @test lateral_deflection(solu, L / 2) > 0
+end
+
+@testset "Example 2 (Z-section) vs exact series, pinned-pinned" begin
+    cases = [
+        (restraint = Restraint(kϕ = 500.0),                q =  1.0,  θ = 0.0),   # Fig. 10
+        (restraint = Restraint(kϕ = 500.0),                q = -1.0,  θ = 0.0),   # Fig. 11
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  3.0,  θ = 0.0),   # Fig. 12
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q = -3.0,  θ = 0.0),   # Fig. 13
+        (restraint = Restraint(kx = 0.1, kϕ = 1500.0),     q =  1.0,  θ = 0.0),   # Fig. 14
+        (restraint = Restraint(kx = 0.1, kϕ = 1000.0),     q =  5.0,  θ = 0.3),   # Fig. 19
+    ]
+    for c in cases
+        sol = solve_beam(model2(q = c.q, θ = c.θ, restraint = c.restraint))
+        for z in (0.2L, 0.42L, 0.5L)
+            ref = series_solution(z; L, section = sec2, material = mat,
+                                  restraint = c.restraint, q = c.q, θ = c.θ)
+            @test twist(sol, z) ≈ ref.ϕ rtol = 1e-4 atol = 1e-8
+            @test lateral_deflection(sol, z) ≈ ref.u rtol = 1e-4
+            @test vertical_deflection(sol, z) ≈ ref.v rtol = 1e-4
+        end
+    end
+end
+
+@testset "Example 2 wavy twist shape, Fig. 14 (kx=0.1, kϕ=1500, q=1)" begin
+    sol = solve_beam(model2(q = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1500.0)))
+    # pinned-pinned curve in Fig. 14: outer portions twist clockwise (ϕ > 0),
+    # central portion counter-clockwise (ϕ < 0)
+    @test twist(sol, 0.2L) > 0
+    @test twist(sol, L / 2) < 0
+    # Section 6: Z-section lateral deflection sign is opposite the C-section
+    # (positive for gravity)
+    @test lateral_deflection(sol, L / 2) > 0
+end
+
+@testset "boundary condition effects, Fig. 3 (kϕ=500, q=1)" begin
+    r = Restraint(kϕ = 500.0)
+    ϕpp = peak_abs_twist(solve_beam(model1(q = 1.0, restraint = r)))
+    ϕpf = peak_abs_twist(solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed)))
+    ϕff = peak_abs_twist(solve_beam(model1(q = 1.0, restraint = r,
+                                           bc_left = :fixed, bc_right = :fixed)))
+    # "the twist is smallest for a fixed-fixed beam and largest for a pinned-pinned beam"
+    @test ϕpp > ϕpf > ϕff > 0
+    # pinned-fixed peak "at or near z = 0.42 L" (Section 3)
+    solpf = solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed))
+    zs = range(0, L, 763)
+    zpeak = zs[argmax(twist.(Ref(solpf), zs))]
+    @test 0.35L < zpeak < 0.50L
+    # gravity twists positive, uplift negative (Figs. 3-4)
+    @test twist(solve_beam(model1(q = 1.0, restraint = r)), L / 2) > 0
+    @test twist(solve_beam(model1(q = -1.0, restraint = r)), L / 2) < 0
+end
+
+@testset "two-span beam ≡ pinned-fixed per span (Section 1)" begin
+    # A symmetric two-span beam with a central support behaves like two
+    # pinned-fixed beams with the fixed end at the central support.
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    two = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                    restraint = r, q = 1.0, interior_supports = [L])
+    sol2 = solve_beam(two)
+    solpf = solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed))
+    for z in (0.2L, 0.42L, 0.6L, 0.8L)
+        @test twist(sol2, z) ≈ twist(solpf, z) rtol = 1e-8 atol = 1e-12
+        @test lateral_deflection(sol2, z) ≈ lateral_deflection(solpf, z) rtol = 1e-8
+        @test vertical_deflection(sol2, z) ≈ vertical_deflection(solpf, z) rtol = 1e-8
+        # symmetry about the central support
+        @test twist(sol2, z) ≈ twist(sol2, 2L - z) rtol = 1e-8 atol = 1e-12
+    end
+    # warping/twist rotation continuity at the central support: ϕ'(L) = 0 by symmetry
+    @test twist(sol2, L - 1.0) ≈ twist(sol2, L + 1.0) rtol = 1e-6 atol = 1e-12
+end
+
+@testset "geometric stiffness: load-deformation nonlinearity (Figs. 3-4)" begin
+    r = Restraint(kϕ = 500.0)
+    ϕ1 = twist(solve_beam(model1(q = 0.5, restraint = r)), L / 2)
+    ϕ2 = twist(solve_beam(model1(q = 1.0, restraint = r)), L / 2)
+    # gravity: softening — twist grows faster than the load (Fig. 3 slopes decrease)
+    @test ϕ2 > 2ϕ1
+    # uplift: stiffening — twist grows slower than the load (Fig. 4 slopes steepen)
+    ϕ1u = twist(solve_beam(model1(q = -0.5, restraint = r)), L / 2)
+    ϕ2u = twist(solve_beam(model1(q = -1.0, restraint = r)), L / 2)
+    @test abs(ϕ2u) < 2abs(ϕ1u)
+    # without Kg the response is exactly linear in q
+    ψ1 = twist(solve_beam(model1(q = 0.5, restraint = r); geometric = false), L / 2)
+    ψ2 = twist(solve_beam(model1(q = 1.0, restraint = r); geometric = false), L / 2)
+    @test ψ2 ≈ 2ψ1 rtol = 1e-9
+end
+
+@testset "critical load from geometric stiffness (unbraced C-section)" begin
+    # For kx = kϕ = 0 and pinned ends, ϕ decouples and the tangent stiffness of
+    # mode 1 vanishes at q_cr = (ECw λ₁⁴ + GJ λ₁²)/ay
+    λ1 = π / L
+    qcr = (mat.E * sec1.Cw * λ1^4 + mat.G * sec1.J * λ1^2) / sec1.ay
+    for (q, sgn) in ((0.98qcr, +1), (1.02qcr, -1))
+        m = model1(q = q)
+        K = elastic_stiffness(m) + geometric_stiffness(m)
+        free = setdiff(1:size(K, 1), constrained_dofs(m))
+        @test sign(eigmin(Symmetric(K[free, free]))) == sgn
+    end
+end
+
+@testset "mesh convergence" begin
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    ϕ = [twist(solve_beam(BeamModel(L = L, nel = n, section = sec2, material = mat,
+                                    restraint = r, q = 3.0, bc_right = :fixed)), 0.42L)
+         for n in (8, 16, 32, 64)]
+    err = abs.(ϕ[1:3] .- ϕ[4])
+    @test err[2] < err[1] && err[3] < err[2]
+    @test abs(ϕ[3] - ϕ[4]) / abs(ϕ[4]) < 1e-4
+end
+
+@testset "element end forces: bending statics (C-section, v uncoupled)" begin
+    q = 1.0
+    # pinned-pinned: Vy(0) = +qL/2, Vy(L) = -qL/2, Mx(0) = 0, Mx(L/2) = -qL²/8
+    f = element_end_forces(solve_beam(model1(q = q)))
+    @test f[1].end1.Vy ≈ q * L / 2 rtol = 1e-9
+    @test f[end].end2.Vy ≈ -q * L / 2 rtol = 1e-9
+    @test abs(f[1].end1.Mx) < 1e-6 * q * L^2 / 8
+    @test f[20].end2.Mx ≈ -q * L^2 / 8 rtol = 1e-9          # nel = 40 → midspan boundary
+    @test f[20].end2.z ≈ L / 2
+    # fixed-fixed: Mx(0) = +qL²/12 (hogging in this convention), Mx(L/2) = -qL²/24
+    f = element_end_forces(solve_beam(model1(q = q, bc_left = :fixed, bc_right = :fixed)))
+    @test f[1].end1.Mx ≈ q * L^2 / 12 rtol = 1e-9
+    @test f[20].end2.Mx ≈ -q * L^2 / 24 rtol = 1e-9
+    @test f[1].end1.Vy ≈ q * L / 2 rtol = 1e-9
+    # pinned-fixed: reactions 3qL/8 and 5qL/8, fixed-end moment qL²/8
+    f = element_end_forces(solve_beam(model1(q = q, bc_right = :fixed)))
+    @test f[1].end1.Vy ≈ 3q * L / 8 rtol = 1e-9
+    @test f[end].end2.Vy ≈ -5q * L / 8 rtol = 1e-9
+    @test f[end].end2.Mx ≈ q * L^2 / 8 rtol = 1e-9
+end
+
+@testset "element end forces: continuity across element boundaries" begin
+    for m in (model1(q = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1000.0), θ = 0.083),
+              model2(q = -1.0, restraint = Restraint(kx = 0.1, kϕ = 500.0), bc_right = :fixed))
+        f = element_end_forces(solve_beam(m))
+        for e in 1:(m.nel - 1), a in (:Vx, :My, :Vy, :Mx, :T, :B)
+            x2, x1 = getfield(f[e].end2, a), getfield(f[e + 1].end1, a)
+            @test isapprox(x2, x1; rtol = 1e-6,
+                           atol = 1e-8 * maximum(abs, [getfield(f[k].end2, a) for k in 1:m.nel]) + 1e-12)
+        end
+    end
+end
+
+@testset "element end forces: torsion and moments vs exact series" begin
+    # Series section forces for pinned-pinned beams: with (u, v, ϕ) = Σ (uₙ, vₙ, ϕₙ) sin(λₙz),
+    #   My = -E Σ (Iy uₙ + Ixy vₙ) λₙ² sin(λₙz)      Mx = -E Σ (Ix vₙ + Ixy uₙ) λₙ² sin(λₙz)
+    #   T  =  Σ ϕₙ λₙ (GJ + ECw λₙ²) cos(λₙz)        B  = -ECw Σ ϕₙ λₙ² sin(λₙz)
+    function series_forces(z; section, restraint, q, nmodes = 19999)
+        (; E, G) = mat
+        (; Ix, Iy, Ixy, J, Cw, ax, ay) = section
+        (; kx, kϕ) = restraint
+        My = Mx = T = B = 0.0
+        for n in 1:2:nmodes
+            λ, c = n * π / L, 4 / (n * π)
+            A = [E*Iy*λ^4 + kx   E*Ixy*λ^4   kx*ay
+                 E*Ixy*λ^4       E*Ix*λ^4    0.0
+                 kx*ay           0.0         E*Cw*λ^4 + G*J*λ^2 + kx*ay^2 + kϕ - q*ay]
+            un, vn, ϕn = A \ (c .* [0.0, q, q * ax])
+            s, co = sin(λ * z), cos(λ * z)
+            My -= E * (Iy * un + Ixy * vn) * λ^2 * s
+            Mx -= E * (Ix * vn + Ixy * un) * λ^2 * s
+            T += ϕn * λ * (G * J + E * Cw * λ^2) * co
+            B -= E * Cw * ϕn * λ^2 * s
+        end
+        return (My = My, Mx = Mx, T = T, B = B)
+    end
+    cases = [(section = sec1, restraint = Restraint(kϕ = 500.0),            q = 1.0),
+             (section = sec1, restraint = Restraint(kx = 0.1, kϕ = 1000.0), q = -1.0),
+             (section = sec2, restraint = Restraint(kx = 0.1, kϕ = 1000.0), q = 3.0)]
+    for c in cases
+        m = BeamModel(L = L, nel = 40, section = c.section, material = mat,
+                      restraint = c.restraint, q = c.q)
+        f = element_end_forces(solve_beam(m))
+        for e in (11, 21)                                     # z = 0.25L, 0.5L
+            z = f[e].end1.z
+            ref = series_forces(z; section = c.section, restraint = c.restraint, q = c.q)
+            @test f[e].end1.My ≈ ref.My rtol = 1e-3 atol = 1e-8
+            @test f[e].end1.Mx ≈ ref.Mx rtol = 1e-3
+            @test f[e].end1.T ≈ ref.T rtol = 1e-3 atol = 1e-6 * abs(c.q) * c.section.ax * L
+            @test f[e].end1.B ≈ ref.B rtol = 1e-3 atol = 1e-8
+        end
+    end
+end
+
+@testset "element end forces: bimoment boundary conditions and torque balance" begin
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    # pinned ends are free to warp → bimoment vanishes there; fixed ends restrain warping
+    f = element_end_forces(solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed)))
+    Bmax = maximum(abs(fe.end2.B) for fe in f)
+    @test abs(f[1].end1.B) < 1e-8 * Bmax
+    @test abs(f[end].end2.B) > 0.1Bmax
+    # global torque balance, unbraced pinned-pinned C-section (kx = kϕ = 0):
+    # T(0) - T(L) = ∫ q (ax + ay ϕ) dz, and T(L) = -T(0) by symmetry
+    q = 0.05
+    sol = solve_beam(model1(q = q))
+    f = element_end_forces(sol)
+    zs = range(0, L, 2001)
+    tint = q * (sec1.ax * L + sec1.ay * sum(twist.(Ref(sol), zs)) * step(zs))
+    @test f[1].end1.T - f[end].end2.T ≈ tint rtol = 1e-6
+    @test f[end].end2.T ≈ -f[1].end1.T rtol = 1e-9
+end
+
+@testset "trapezoidal load: reduction to uniform and linearity" begin
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    # equal end intensities assemble identically to a scalar uniform load
+    @test solve_beam(model1(q = (1.0, 1.0), restraint = r)).d ≈
+          solve_beam(model1(q = 1.0, restraint = r)).d rtol = 1e-12
+    # without Kg the problem is linear: trapezoid = uniform + triangle
+    dsum = solve_beam(model1(q = 1.0, restraint = r); geometric = false).d .+
+           solve_beam(model1(q = (0.0, 1.0), restraint = r); geometric = false).d
+    @test solve_beam(model1(q = (1.0, 2.0), restraint = r); geometric = false).d ≈
+          dsum rtol = 1e-9
+end
+
+@testset "trapezoidal load: triangular bending statics (v uncoupled)" begin
+    # pinned-pinned, load 0 → w: reactions wL/6 and wL/3, M(L/2) = wL²/16
+    w = 1.0
+    f = element_end_forces(solve_beam(model1(q = (0.0, w))))
+    @test f[1].end1.Vy ≈ w * L / 6 rtol = 1e-9
+    @test f[end].end2.Vy ≈ -w * L / 3 rtol = 1e-9
+    @test f[20].end2.Mx ≈ -w * L^2 / 16 rtol = 1e-9
+    # max moment of a triangular load at z = L/√3, M = wL²/(9√3)
+    zmax = L / sqrt(3)
+    Mmax = -w * L^2 / (9 * sqrt(3))
+    m = BeamModel(L = L, nel = 100, section = sec1, material = mat, q = (0.0, w))
+    zs = [fe.end2.z for fe in element_end_forces(solve_beam(m))]
+    Ms = [fe.end2.Mx for fe in element_end_forces(solve_beam(m))]
+    e = argmin(abs.(zs .- zmax))
+    @test Ms[e] ≈ Mmax rtol = 1e-3
+end
+
+@testset "trapezoidal load vs spectral Galerkin reference" begin
+    # Independent reference: sine-basis Galerkin solution of Eqs. (2)-(4) for a
+    # pinned-pinned beam. A linearly varying load q(z) makes the geometric
+    # coefficient w(z) = qx(z)ax - qy(z)ay = α + βz non-constant, which couples
+    # the modes: with ϕ = Σ ϕₙ sin(λₙz),
+    #   (2/L)∫ z sin(λₘz) sin(λₙz) dz = L/2 (m = n),
+    #                                 = (2L/π²)[1/(m+n)² - 1/(m-n)²] (m±n odd), 0 else.
+    function spectral_solution(z; section, restraint, q1, q2, θ = 0.0, N = 200)
+        (; E, G) = mat
+        (; Ix, Iy, Ixy, J, Cw, ax, ay) = section
+        (; kx, kϕ) = restraint
+        s, c = sin(θ), cos(θ)
+        # modal coefficient of a field varying linearly from ra (z=0) to rb (z=L)
+        lincoeff(ra, rb, m) = 2 * (1 - (-1)^m) * ra / (m * π) +
+                              2 * (-1)^(m + 1) * (rb - ra) / (m * π)
+        A = zeros(3N, 3N)
+        b = zeros(3N)
+        α, β = -(s * ax + c * ay) * q1, -(s * ax + c * ay) * (q2 - q1) / L
+        for m in 1:N
+            λ = m * π / L
+            iu, iv, iϕ = 3m - 2, 3m - 1, 3m
+            A[iu, iu] = E * Iy * λ^4 + kx
+            A[iu, iv] = E * Ixy * λ^4
+            A[iu, iϕ] = kx * ay
+            A[iv, iu] = E * Ixy * λ^4
+            A[iv, iv] = E * Ix * λ^4
+            A[iϕ, iu] = kx * ay
+            A[iϕ, iϕ] = E * Cw * λ^4 + G * J * λ^2 + kx * ay^2 + kϕ + α
+            for n in 1:N
+                Z = m == n ? L / 2 :
+                    isodd(m - n) ? (2L / π^2) * (1 / (m + n)^2 - 1 / (m - n)^2) : 0.0
+                A[iϕ, 3n] += β * Z
+            end
+            b[iu] = lincoeff(-q1 * s, -q2 * s, m)
+            b[iv] = lincoeff(q1 * c, q2 * c, m)
+            b[iϕ] = lincoeff(q1 * (c * ax - s * ay), q2 * (c * ax - s * ay), m)
+        end
+        x = A \ b
+        u = v = ϕ = 0.0
+        for m in 1:N
+            sλ = sin(m * π * z / L)
+            u += x[3m - 2] * sλ; v += x[3m - 1] * sλ; ϕ += x[3m] * sλ
+        end
+        return (u = u, v = v, ϕ = ϕ)
+    end
+    cases = [
+        (model = model1, section = sec1, restraint = Restraint(kx = 0.1, kϕ = 1000.0),
+         q = (0.5, 1.5), θ = 0.0),
+        (model = model1, section = sec1, restraint = Restraint(kϕ = 500.0),
+         q = (-0.5, -1.5), θ = 0.0),                                    # uplift trapezoid
+        (model = model1, section = sec1, restraint = Restraint(kx = 0.1, kϕ = 1000.0),
+         q = (1.0, 2.0), θ = 0.083),                                    # with roof slope
+        (model = model2, section = sec2, restraint = Restraint(kx = 0.1, kϕ = 1000.0),
+         q = (0.0, 3.0), θ = 0.0),                                      # triangular, Z-section
+    ]
+    for cs in cases
+        sol = solve_beam(cs.model(q = cs.q, θ = cs.θ, restraint = cs.restraint))
+        for z in (0.25L, 0.5L, 0.75L)
+            ref = spectral_solution(z; section = cs.section, restraint = cs.restraint,
+                                    q1 = cs.q[1], q2 = cs.q[2], θ = cs.θ)
+            @test twist(sol, z) ≈ ref.ϕ rtol = 1e-4 atol = 1e-8
+            @test lateral_deflection(sol, z) ≈ ref.u rtol = 1e-4 atol = 1e-10
+            @test vertical_deflection(sol, z) ≈ ref.v rtol = 1e-4
+        end
+    end
+    # asymmetry: heavier end draws the twist peak past midspan
+    sol = solve_beam(model1(q = (0.0, 1.0), restraint = Restraint(kϕ = 500.0)))
+    zs = range(0, L, 763)
+    @test zs[argmax(twist.(Ref(sol), zs))] > 0.5L
+end
+
+@testset "trapezoidal load: torque balance (unbraced C-section)" begin
+    # kx = kϕ = 0: T(0) - T(L) = ∫ q(z)(ax + ay ϕ(z)) dz, twist-dependent torque included
+    q1, q2 = 0.02, 0.08
+    sol = solve_beam(model1(q = (q1, q2)))
+    f = element_end_forces(sol)
+    zs = range(0, L, 2001)
+    qz = q1 .+ (q2 - q1) .* zs ./ L
+    tz = qz .* (sec1.ax .+ sec1.ay .* twist.(Ref(sol), zs))
+    tint = (sum(tz) - (tz[1] + tz[end]) / 2) * step(zs)     # trapezoidal rule
+    @test f[1].end1.T - f[end].end2.T ≈ tint rtol = 1e-5
+end
+
+@testset "input validation" begin
+    @test_throws ArgumentError model1(q = 1.0, bc_left = :clamped)
+    @test_throws ArgumentError model1(q = (1.0, 2.0, 3.0))
+    @test_throws ArgumentError BeamModel(L = 2L, nel = 80, section = sec1,
+                                         material = mat, q = 1.0,
+                                         interior_supports = [L + 13.0])
+    sol = solve_beam(model1(q = 1.0))
+    @test_throws DomainError twist(sol, -1.0)
+    @test sol.residual_norm < 1e-8
+end
+
+end
