@@ -439,6 +439,77 @@ end
     @test f[1].end1.T - f[end].end2.T ≈ tint rtol = 1e-5
 end
 
+@testset "per-span loads: reduce to whole-beam q when spans agree" begin
+    # Two equal spans, same uniform load on each -- must exactly match the
+    # existing whole-beam scalar-q API (Ixy=0 C-section decouples v from u/ϕ).
+    two_scalar = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                           q = 1.0, interior_supports = [L])
+    two_perspan = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                            q = [1.0, 1.0], interior_supports = [L])
+    @test solve_beam(two_perspan).d ≈ solve_beam(two_scalar).d rtol = 1e-12
+    # same check with a trapezoidal whole-beam load split into two per-span
+    # trapezoids that agree at the shared support
+    two_scalar_trap = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                                q = (0.0, 2.0), interior_supports = [L])
+    two_perspan_trap = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                                 q = [(0.0, 1.0), (1.0, 2.0)], interior_supports = [L])
+    @test solve_beam(two_perspan_trap).d ≈ solve_beam(two_scalar_trap).d rtol = 1e-9
+end
+
+@testset "per-span loads: two equal spans, different uniform loads per span" begin
+    # Classical three-moment theorem, two equal spans L, pinned outer ends,
+    # UDL w1 on span 1 and w2 on span 2: M_B = (w1+w2) L² / 16 at the shared
+    # support (reduces to the standard wL²/8 continuous-beam result at w1=w2=w).
+    w1, w2 = 1.0, 3.0
+    m = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                 q = [w1, w2], interior_supports = [L])
+    sol = solve_beam(m)
+    f = element_end_forces(sol)
+    e_at_support = m.nel ÷ 2
+    @test f[e_at_support].end2.z ≈ L
+    MB_expected = (w1 + w2) * L^2 / 16
+    @test f[e_at_support].end2.Mx ≈ MB_expected rtol = 1e-6
+    @test f[e_at_support].end2.Mx ≈ f[e_at_support + 1].end1.Mx rtol = 1e-9   # moment continuity
+    # global vertical equilibrium: end reactions + interior reaction (the shear
+    # jump across the support) sum to the total applied load
+    R_left, R_right = f[1].end1.Vy, -f[end].end2.Vy
+    R_interior = f[e_at_support + 1].end1.Vy - f[e_at_support].end2.Vy
+    @test R_left + R_interior + R_right ≈ (w1 + w2) * L rtol = 1e-6
+end
+
+@testset "per-span loads: trapezoidal exterior spans, uniform interior spans" begin
+    # 5-span line mirroring the RoofHugger snow-drift use case: exterior spans
+    # carry a trapezoidal drift load, interior spans a uniform load, with an
+    # intentional jump discontinuity at each interior support.
+    spans = fill(L, 5)
+    zs = [0.0; cumsum(spans)]
+    q_per_span = [(0.5, 1.0), 1.0, 1.5, 1.0, (1.0, 0.5)]   # jumps: 1.0->1.0 (none), 1.0->1.5, 1.5->1.0, 1.0->1.0
+    m = BeamModel(L = zs[end], nel = 5 * 80, section = sec1, material = mat,
+                 q = q_per_span, interior_supports = zs[2:end-1])
+    sol = solve_beam(m)
+    f = element_end_forces(sol)
+    # global vertical equilibrium: sum of all reactions (both ends + the shear
+    # jump at each interior support) equals the total applied load
+    total_load = sum((q_per_span[i] isa Real ? q_per_span[i] : sum(q_per_span[i]) / 2) * spans[i]
+                      for i in 1:5)
+    per_span_elements = m.nel ÷ 5
+    R_left, R_right = f[1].end1.Vy, -f[end].end2.Vy
+    R_interior = [f[k * per_span_elements + 1].end1.Vy - f[k * per_span_elements].end2.Vy for k in 1:4]
+    @test R_left + sum(R_interior) + R_right ≈ total_load rtol = 1e-6
+    # moment continuity at every interior support despite the load jumps
+    for k in 1:4
+        e = k * per_span_elements
+        @test f[e].end2.z ≈ zs[k + 1]
+        @test f[e].end2.Mx ≈ f[e + 1].end1.Mx rtol = 1e-6 atol = 1e-8
+    end
+end
+
+@testset "per-span loads: input validation" begin
+    @test_throws ArgumentError model1(q = [1.0, 2.0])                 # wrong span count (1 span, 2 entries)
+    @test_throws ArgumentError BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
+                                        q = [(1.0, 2.0, 3.0), 1.0], interior_supports = [L])
+end
+
 @testset "input validation" begin
     @test_throws ArgumentError model1(q = 1.0, bc_left = :clamped)
     @test_throws ArgumentError model1(q = (1.0, 2.0, 3.0))

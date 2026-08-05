@@ -23,8 +23,10 @@ each of the three fields u(z), v(z), ϕ(z). Each node carries six degrees of fre
 i.e. lateral and vertical translations, rotations about the y and x axes, twist,
 and warping (rate of twist).
 
-The distributed load may be uniform or trapezoidal (linearly varying between the
-end intensities). The ϕ-dependent load terms on the right-hand side of Eq. (4) are
+The distributed load may be uniform, trapezoidal (linearly varying between the
+end intensities), or given independently per span (see [`BeamModel`](@ref)),
+allowing a load to jump discontinuously at a shared support. The ϕ-dependent
+load terms on the right-hand side of Eq. (4) are
 moved to the left-hand side and assembled as a geometric (load) stiffness matrix
 
     Kg[ϕϕ] = ∫ (qx(z) ax - qy(z) ay) Nᵀ N dz
@@ -102,9 +104,16 @@ uplift) with roof slope angle `θ` (rad, Eq. 1 and Fig. 2). The load may be
 
   * uniform — `q` a scalar, or
   * trapezoidal — `q = (q1, q2)`, the intensities at `z = 0` and `z = L`, varying
-    linearly in between (a triangular load is the special case with one end zero).
+    linearly in between (a triangular load is the special case with one end zero), or
+  * per-span — `q` a `Vector` with one entry per span (a "span" is the segment
+    between two consecutive supports: the two ends plus every `interior_support`,
+    in order), each entry itself a scalar (uniform over that span) or a 2-tuple
+    (trapezoidal, linear from the first value at that span's own start to the
+    second at that span's own end). Spans are independent: adjacent spans need
+    not agree at a shared support, so a load can jump discontinuously there
+    (e.g. a uniform interior span next to a trapezoidal drift-loaded end span).
 
-With a trapezoidal load, both the consistent load vector and the geometric (load)
+With a non-uniform load, both the consistent load vector and the geometric (load)
 stiffness vary from element to element; the element integrals are evaluated
 exactly with 4-point Gauss quadrature.
 
@@ -122,7 +131,7 @@ struct BeamModel
     section::Section
     material::Material
     restraint::Restraint
-    q::NTuple{2, Float64}     # load intensity at z = 0 and z = L
+    q_per_element::Vector{NTuple{2, Float64}}     # (q1, q2) load intensity at each element's two ends
     θ::Float64
     bc_left::Symbol
     bc_right::Symbol
@@ -137,17 +146,13 @@ function BeamModel(; L, nel, section, material, restraint = Restraint(),
             throw(ArgumentError("boundary condition must be :pinned or :fixed, got $bc"))
     end
     nel >= 2 || throw(ArgumentError("need at least 2 elements"))
-    qt = if q isa Real
-        (Float64(q), Float64(q))
-    elseif length(q) == 2
-        (Float64(q[1]), Float64(q[2]))
-    else
-        throw(ArgumentError("q must be a scalar (uniform) or two values (q1, q2) " *
-                            "at z = 0 and z = L (trapezoidal), got $q"))
-    end
-    model = BeamModel(Float64(L), Int(nel), section, material, restraint,
-                      qt, Float64(θ), bc_left, bc_right,
-                      Float64.(collect(interior_supports)))
+    L = Float64(L)
+    interior_supports = Float64.(collect(interior_supports))
+    Le = L / nel
+    q_per_element = build_q_per_element(q, L, nel, Le, interior_supports)
+    model = BeamModel(L, Int(nel), section, material, restraint,
+                      q_per_element, Float64(θ), bc_left, bc_right,
+                      interior_supports)
     support_nodes(model)  # validate interior supports fall on mesh nodes
     return model
 end
@@ -156,27 +161,75 @@ nnodes(m::BeamModel) = m.nel + 1
 ndofs(m::BeamModel) = 6 * nnodes(m)
 elength(m::BeamModel) = m.L / m.nel
 
-"Load intensity q(z), linear between the end values (constant when they are equal)."
-load_intensity(m::BeamModel, z::Real) = m.q[1] + (m.q[2] - m.q[1]) * z / m.L
+"""
+    compute_support_nodes(interior_supports, L, nel)
 
-"Load components along the x and y axes at location z for roof slope θ, Eq. (1)."
-function load_components(m::BeamModel, z::Real)
-    q = load_intensity(m, z)
-    return (qx = -q * sin(m.θ), qy = q * cos(m.θ))
-end
-
-function support_nodes(m::BeamModel)
-    Le = elength(m)
+Node index (1-based) of each interior support, validating that it coincides
+with a mesh node of a beam of length `L` meshed with `nel` equal elements.
+"""
+function compute_support_nodes(interior_supports, L, nel)
+    Le = L / nel
+    nn = nel + 1
     nodes = Int[]
-    for zs in m.interior_supports
+    for zs in interior_supports
         node = round(Int, zs / Le) + 1
-        isapprox((node - 1) * Le, zs; atol = 1e-8 * m.L) ||
+        isapprox((node - 1) * Le, zs; atol = 1e-8 * L) ||
             throw(ArgumentError("interior support at z = $zs does not coincide with a mesh node"))
-        (1 < node < nnodes(m)) ||
+        (1 < node < nn) ||
             throw(ArgumentError("interior support at z = $zs is not interior to the span"))
         push!(nodes, node)
     end
     return nodes
+end
+
+support_nodes(m::BeamModel) = compute_support_nodes(m.interior_supports, m.L, m.nel)
+
+"""
+    build_q_per_element(q, L, nel, Le, interior_supports)
+
+Normalize the user-supplied `q` (see [`BeamModel`](@ref)) into one `(q1, q2)`
+pair per element -- the load intensity at that element's two ends.
+"""
+function build_q_per_element(q, L, nel, Le, interior_supports)
+    if q isa AbstractVector
+        support_z = sort(interior_supports)
+        span_bounds = [0.0; support_z; L]
+        nspans = length(span_bounds) - 1
+        length(q) == nspans || throw(ArgumentError(
+            "q vector must have one entry per span ($nspans spans here), got $(length(q)) entries"))
+        boundary_nodes = [1; compute_support_nodes(support_z, L, nel); nel + 1]
+        q_per_element = Vector{NTuple{2, Float64}}(undef, nel)
+        for i in 1:nspans
+            qa, qb = q[i] isa Real ? (Float64(q[i]), Float64(q[i])) :
+                     length(q[i]) == 2 ? (Float64(q[i][1]), Float64(q[i][2])) :
+                     throw(ArgumentError("span $i entry must be a scalar or two values (q1, q2), got $(q[i])"))
+            zA, zB = span_bounds[i], span_bounds[i + 1]
+            span_len = zB - zA
+            for e in boundary_nodes[i]:(boundary_nodes[i + 1] - 1)
+                z1, z2 = (e - 1) * Le, e * Le
+                q_per_element[e] = (qa + (qb - qa) * (z1 - zA) / span_len,
+                                     qa + (qb - qa) * (z2 - zA) / span_len)
+            end
+        end
+        return q_per_element
+    end
+    qt = if q isa Real
+        (Float64(q), Float64(q))
+    elseif length(q) == 2
+        (Float64(q[1]), Float64(q[2]))
+    else
+        throw(ArgumentError("q must be a scalar (uniform), two values (q1, q2) at z = 0 " *
+                            "and z = L (trapezoidal), or a per-span vector, got $q"))
+    end
+    return [(qt[1] + (qt[2] - qt[1]) * (e - 1) * Le / L,
+             qt[1] + (qt[2] - qt[1]) * e * Le / L) for e in 1:nel]
+end
+
+"Load components (qx1,qy1,qx2,qy2) at the two ends of element `e`, Eq. (1)."
+function element_load_endpoints(m::BeamModel, e::Int)
+    q1, q2 = m.q_per_element[e]
+    s, c = sin(m.θ), cos(m.θ)
+    return (qx1 = -q1 * s, qy1 = q1 * c, qx2 = -q2 * s, qy2 = q2 * c)
 end
 
 # ------------------------------------------------------------------
@@ -284,8 +337,7 @@ integrated exactly.
 function geometric_element_stiffness(m::BeamModel, e::Int)
     (; ax, ay) = m.section
     Le = elength(m)
-    qx1, qy1 = load_components(m, (e - 1) * Le)
-    qx2, qy2 = load_components(m, e * Le)
+    (; qx1, qy1, qx2, qy2) = element_load_endpoints(m, e)
     kf = k_found_linear(Le, qx1 * ax - qy1 * ay, qx2 * ax - qy2 * ay)
     ke = zeros(12, 12)
     add_block!(ke, ΦDOF, ΦDOF, 1.0, kf)
@@ -302,8 +354,7 @@ varying linearly over the element for a trapezoidal load.
 function element_load_vector(m::BeamModel, e::Int)
     (; ax, ay) = m.section
     Le = elength(m)
-    qx1, qy1 = load_components(m, (e - 1) * Le)
-    qx2, qy2 = load_components(m, e * Le)
+    (; qx1, qy1, qx2, qy2) = element_load_endpoints(m, e)
     fe = zeros(12)
     fe[collect(UDOF)] = f_linear(Le, qx1, qx2)
     fe[collect(VDOF)] = f_linear(Le, qy1, qy2)
