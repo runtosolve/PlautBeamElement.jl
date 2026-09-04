@@ -42,11 +42,6 @@ module PlautBeamFiniteElement
 using LinearAlgebra
 using NonlinearSolve
 
-export Section, Material, Restraint, BeamModel, BeamSolution
-export elastic_stiffness, geometric_stiffness, load_vector, constrained_dofs
-export solve_beam, deflections, twist, lateral_deflection, vertical_deflection
-export element_end_forces
-
 # ------------------------------------------------------------------
 # Input types
 # ------------------------------------------------------------------
@@ -96,7 +91,8 @@ Restraint(; kx = 0.0, kϕ = 0.0) = Restraint(kx, kϕ)
 
 """
     BeamModel(; L, nel, section, material, restraint=Restraint(), q, θ=0.0,
-                bc_left=:pinned, bc_right=:pinned, interior_supports=Float64[])
+                bc_left=:pinned, bc_right=:pinned, interior_supports=Float64[],
+                interior_dofs=nothing)
 
 Uniform beam of length `L` meshed with `nel` equal elements, carrying a distributed
 load applied at the center of the top flange (positive = gravity, negative =
@@ -117,14 +113,23 @@ With a non-uniform load, both the consistent load vector and the geometric (load
 stiffness vary from element to element; the element integrals are evaluated
 exactly with 4-point Gauss quadrature.
 
-End boundary conditions (`bc_left`, `bc_right`):
+End conditions `bc_left`/`bc_right`, and each entry of `interior_dofs`, accept
+either a preset symbol or a full 6-element `(u, u', v, v', ϕ, ϕ')` tuple of
+`"fixed"`/`"free"` strings, so any support -- end or interior -- can restrain an
+arbitrary combination of DOFs:
 
-  * `:pinned` — u = v = ϕ = 0 (free to warp and to rotate about x and y)
-  * `:fixed`  — u = u' = v = v' = ϕ = ϕ' = 0
+  * `:pinned` — u = v = ϕ = "fixed" (free to warp and to rotate about x and y)
+  * `:fixed`  — u = u' = v = v' = ϕ = ϕ' = "fixed"
+  * `:free`   — nothing restrained
+  * or a custom tuple, e.g. `("fixed", "free", "fixed", "free", "free", "free")`
+    (u, v fixed; u', v', ϕ, ϕ' free)
 
-`interior_supports` is a list of z locations (each must coincide with a mesh node)
-where u = v = ϕ = 0, e.g. the central support of a two-span beam.
+`interior_supports` is a list of z locations (each must coincide with a mesh node),
+e.g. the central support of a two-span beam. `interior_dofs` gives the condition
+at each of those locations (one-to-one, same order); it defaults to `:pinned`
+(u = v = ϕ = "fixed") at every interior support.
 """
+
 struct BeamModel
     L::Float64
     nel::Int
@@ -133,27 +138,42 @@ struct BeamModel
     restraint::Restraint
     q_per_element::Vector{NTuple{2, Float64}}     # (q1, q2) load intensity at each element's two ends
     θ::Float64
-    bc_left::Symbol
-    bc_right::Symbol
+    bc_left::NTuple{6, String}
+    bc_right::NTuple{6, String}
     interior_supports::Vector{Float64}
+    interior_dofs::Vector{NTuple{6, String}}
 end
 
 function BeamModel(; L, nel, section, material, restraint = Restraint(),
                    q, θ = 0.0, bc_left = :pinned, bc_right = :pinned,
-                   interior_supports = Float64[])
-    for bc in (bc_left, bc_right)
-        bc in (:pinned, :fixed) ||
-            throw(ArgumentError("boundary condition must be :pinned or :fixed, got $bc"))
+                   interior_supports = Float64[], interior_dofs = nothing)
+
+    bc_left = dof_condition(bc_left)
+    bc_right = dof_condition(bc_right)
+    for bc in (bc_left, bc_right), val in bc
+        val in ("fixed", "free") ||
+            throw(ArgumentError("bc_left/bc_right entries must be \"fixed\" or \"free\", got $(repr(val))"))
     end
+
     nel >= 2 || throw(ArgumentError("need at least 2 elements"))
     L = Float64(L)
     interior_supports = Float64.(collect(interior_supports))
+    conditions = interior_dofs === nothing ?
+        fill(("fixed","free","fixed","free","fixed","free"),length(interior_supports)) :
+        [dof_condition(c) for c in interior_dofs]
+    length(conditions) == length(interior_supports) || throw(ArgumentError("interior_dofs must have one entry per interior support" *
+    "($(length(interior_supports)) supports, got $(length(conditions)) conditions)"))
+
+    for cond in conditions, val in cond
+        val in ("fixed", "free") ||
+            throw(ArgumentError("interior_dofs entries must be \"fixed\" or \"free\", got $(repr(val))"))
+    end
     Le = L / nel
-    q_per_element = build_q_per_element(q, L, nel, Le, interior_supports)
-    model = BeamModel(L, Int(nel), section, material, restraint,
-                      q_per_element, Float64(θ), bc_left, bc_right,
-                      interior_supports)
+    q_per_element = build_q_per_element(q,L,nel,Le,interior_supports)
+    model = BeamModel(L,Int(nel),section,material,restraint,
+                        q_per_element,Float64(θ), bc_left, bc_right, interior_supports, conditions)
     support_nodes(model)  # validate interior supports fall on mesh nodes
+
     return model
 end
 
@@ -399,6 +419,18 @@ function load_vector(m::BeamModel)
     return F
 end
 
+"1-based local DOF indices, in order (u,u',v,v',ϕ,ϕ'), that are \"fixed\" in 'condition'"
+fixed_local_dofs(condition) = findall(==("fixed"),condition)
+
+"Expand a bc/support preset symbol into a 6-element (u,u',v,v',ϕ,ϕ') condition; a non-symbol is passed through unchanged."
+function dof_condition(bc)
+    bc isa Symbol || return bc
+    bc === :pinned && return ("fixed", "free", "fixed", "free", "fixed", "free")
+    bc === :fixed && return ("fixed", "fixed", "fixed", "fixed", "fixed", "fixed")
+    bc === :free && return ("free", "free", "free", "free", "free", "free")
+    throw(ArgumentError("unknown support preset :$bc; use :pinned, :fixed, or :free, or a 6-element (u,u',v,v',ϕ,ϕ') tuple"))
+end
+
 """
     constrained_dofs(model)
 
@@ -407,12 +439,11 @@ conditions and any interior supports.
 """
 function constrained_dofs(m::BeamModel)
     dofs = Int[]
-    bcdofs(bc) = bc === :fixed ? (1, 2, 3, 4, 5, 6) : (1, 3, 5)   # pinned: u, v, ϕ
-    append!(dofs, bcdofs(m.bc_left))
+    append!(dofs, fixed_local_dofs(m.bc_left))
     offset = 6 * (nnodes(m) - 1)
-    append!(dofs, offset .+ collect(bcdofs(m.bc_right)))
-    for node in support_nodes(m)
-        append!(dofs, 6 * (node - 1) .+ [1, 3, 5])                # u, v, ϕ
+    append!(dofs, offset .+ fixed_local_dofs(m.bc_right))
+    for (node,cond) in zip(support_nodes(m), m.interior_dofs)
+        append!(dofs, 6 * (node - 1) .+ fixed_local_dofs(cond))                # u, v, ϕ
     end
     return sort(unique(dofs))
 end

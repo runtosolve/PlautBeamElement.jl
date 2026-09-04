@@ -1,4 +1,7 @@
-using PlautBeamFiniteElement
+using PlautBeamFiniteElement: Section, Material, Restraint, BeamModel, BeamSolution,
+                              elastic_stiffness, geometric_stiffness, load_vector,
+                              constrained_dofs, solve_beam, deflections, twist,
+                              lateral_deflection, vertical_deflection, element_end_forces
 using Test
 using LinearAlgebra
 

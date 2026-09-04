@@ -44,7 +44,8 @@ Consistent N–mm units: `E`, `G`, `kx` in N/mm², `I`, `J` in mm⁴, `Cw` in mm
 `kϕ` in N/rad, `q` in N/mm (= kN/m), `θ` in rad.
 
 ```julia
-using PlautBeamFiniteElement
+using PlautBeamFiniteElement: Section, Material, Restraint, BeamModel, solve_beam,
+                              twist, lateral_deflection, deflections, element_end_forces
 
 # Example 1 of the paper: 9CS2.5×059 C-section stud, L = 7620 mm
 section   = Section(Ix = 4.287e6, Iy = 290500.0, J = 424.56,
