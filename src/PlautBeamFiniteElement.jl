@@ -513,7 +513,9 @@ end
 
 function eval_field(sol::BeamSolution, z::Real, field::NTuple{4, Int})
     m = sol.model
-    (0 <= z <= m.L) || throw(DomainError(z, "z must be within [0, L]"))
+    tol = 1e-8 * m.L
+    (-tol <= z <= m.L + tol) || throw(DomainError(z, "z must be within [0, L]"))
+    z = clamp(z, 0.0, m.L)  # absorb floating-point drift from a caller's cumsum-built z-mesh
     Le = elength(m)
     e = min(max(1, floor(Int, z / Le) + 1), m.nel)
     ξ = (z - (e - 1) * Le) / Le
