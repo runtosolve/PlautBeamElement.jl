@@ -32,7 +32,8 @@ moved to the left-hand side and assembled as a geometric (load) stiffness matrix
     Kg[ϕϕ] = ∫ (qx(z) ax - qy(z) ay) Nᵀ N dz
 
 so the discrete equilibrium is  [Ke + Kg(q)] d = F(q), solved here with
-NonlinearSolve.jl via the residual R(d) = [Ke + Kg(q)] d - F(q).
+NonlinearSolve.jl via the residual R(d) = [Ke + Kg(q)] d - F(q) ([`solve_beam`](@ref)),
+or directly with a sparse factorization ([`solve_beam_linear`](@ref)).
 
 Consistent units are expected, e.g. N and mm: E, G in N/mm², I in mm⁴, J in mm⁴,
 Cw in mm⁶, kx in N/mm², kϕ in N/rad (= N·mm/rad per mm), q in N/mm (= kN/m).
@@ -41,6 +42,7 @@ module PlautBeamFiniteElement
 
 using LinearAlgebra
 using NonlinearSolve
+using SparseArrays
 
 # ------------------------------------------------------------------
 # Input types
@@ -498,6 +500,68 @@ function solve_beam(m::BeamModel; geometric::Bool = true, abstol = 1e-9)
     d = zeros(ndofs(m))
     d[free] = sol.u
     return BeamSolution(m, d, norm(residual(sol.u, p)), geometric)
+end
+
+# ------------------------------------------------------------------
+# Sparse assembly and direct linear solution
+# ------------------------------------------------------------------
+
+"""
+    sparse_stiffness(model; geometric=true)
+
+Global stiffness K = Ke + Kg(q) (or Ke alone with `geometric=false`) assembled as a
+sparse matrix. Each element couples only its own 12 DOFs, so K is banded and its
+storage grows linearly with the number of elements, where the dense
+[`elastic_stiffness`](@ref) and [`geometric_stiffness`](@ref) grow quadratically.
+"""
+function sparse_stiffness(m::BeamModel; geometric::Bool = true)
+    ke_elastic = elastic_element_stiffness(m)
+    n = 144 * m.nel
+    I = Vector{Int}(undef, n)
+    J = Vector{Int}(undef, n)
+    V = Vector{Float64}(undef, n)
+    k = 0
+    for e in 1:m.nel
+        dofs = element_dofs(e)
+        ke = geometric ? ke_elastic + geometric_element_stiffness(m, e) : ke_elastic
+        for c in 1:12, r in 1:12
+            k += 1
+            I[k] = dofs[r]
+            J[k] = dofs[c]
+            V[k] = ke[r, c]
+        end
+    end
+    return sparse(I, J, V, ndofs(m), ndofs(m))   # entries shared by neighbouring elements are summed
+end
+
+"""
+    solve_beam_linear(model; geometric=true)
+
+Same equilibrium as [`solve_beam`](@ref), [Ke + Kg(q)] d = F(q), solved directly
+with one sparse LU factorization instead of Newton-Raphson. Kg depends on the
+load q but not on the displacements d, so the system is linear in d: Newton-
+Raphson converges in a single step to this same solution. Assembling K sparse and
+solving it directly avoids the dense matrices and the automatic-differentiation
+Jacobian, which dominate the run time and memory of `solve_beam` on fine meshes.
+`residual_norm` is the diagonally scaled residual used by `solve_beam`.
+"""
+function solve_beam_linear(m::BeamModel; geometric::Bool = true)
+    K = sparse_stiffness(m; geometric)
+    F = load_vector(m)
+
+    free = setdiff(1:ndofs(m), constrained_dofs(m))
+    Kf = K[free, free]
+    Ff = F[free]
+
+    factorization = lu(Kf; check = false)
+    issuccess(factorization) ||
+        error("singular stiffness matrix; the load may be at the critical (singular-stiffness) level")
+    df = factorization \ Ff
+
+    scale = max.(abs.(diag(Kf)), eps())
+    d = zeros(ndofs(m))
+    d[free] = df
+    return BeamSolution(m, d, norm((Kf * df - Ff) ./ scale), geometric)
 end
 
 # ------------------------------------------------------------------
