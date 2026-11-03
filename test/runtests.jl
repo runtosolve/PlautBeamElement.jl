@@ -1,4 +1,4 @@
-using PlautBeamFiniteElement: Section, Material, Restraint, BeamModel, BeamSolution,
+using PlautBeamElement: Section, Material, Restraint, BeamModel, BeamSolution,
                               elastic_stiffness, geometric_stiffness, load_vector,
                               constrained_dofs, solve_beam, deflections, twist,
                               lateral_deflection, vertical_deflection, element_end_forces
@@ -53,7 +53,7 @@ peak_abs_twist(sol; npts = 401) = maximum(abs, twist.(Ref(sol), range(0, sol.mod
 
 # ==================================================================
 
-@testset "PlautBeamFiniteElement" begin
+@testset "PlautBeamElement" begin
 
 @testset "stiffness matrix properties" begin
     m = model1(q = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1000.0))
@@ -226,6 +226,12 @@ end
         free = setdiff(1:size(K, 1), constrained_dofs(m))
         @test sign(eigmin(Symmetric(K[free, free]))) == sgn
     end
+    # direct linear solve satisfies equilibrium on either side of q_cr
+    @test solve_beam(model1(q = 0.98qcr)).residual_norm < 1e-8
+    @test solve_beam(model1(q = 1.02qcr)).residual_norm < 1e-8
+    # gravity softening: twist magnifies as q -> q_cr
+    @test twist(solve_beam(model1(q = 0.98qcr)), L / 2) / (0.98qcr) >
+          10 * twist(solve_beam(model1(q = 0.5qcr)), L / 2) / (0.5qcr)
 end
 
 @testset "mesh convergence" begin

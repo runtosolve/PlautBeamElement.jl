@@ -1,4 +1,4 @@
-# PlautBeamFiniteElement.jl
+# PlautBeamElement.jl
 
 A beam finite element for the lateral-torsional deformation of continuously braced
 thin-walled beams, implementing the governing equations of:
@@ -29,9 +29,10 @@ and warping `ϕ'`.
   load-position terms on the right-hand side of Eq. (4), `(qx ax - qy ay) ϕ` —
   softening for gravity load applied above the shear center, stiffening for uplift.
   This is what makes the load–twist curves of the paper's Figs. 3–16 nonlinear.
-* **Solution**: the equilibrium residual `R(d) = [Ke + Kg(q)] d − F(q)` is solved
-  with [NonlinearSolve.jl](https://github.com/SciML/NonlinearSolve.jl)
-  (Newton–Raphson, diagonally equilibrated residual).
+* **Solution**: `Kg` depends on the load `q` but not on the displacements, so for a
+  given load `[Ke + Kg(q)] d = F(q)` is a linear system, solved directly by LU
+  factorization of the reduced stiffness (an error is raised if it is singular).
+  The load–deformation curves are nonlinear in `q` only because `Kg` scales with `q`.
 
 Boundary conditions follow the paper: `:pinned` (`u = v = ϕ = 0`, free to warp) and
 `:fixed` (`u = u' = v = v' = ϕ = ϕ' = 0`). Interior supports (`u = v = ϕ = 0`) model
@@ -44,7 +45,7 @@ Consistent N–mm units: `E`, `G`, `kx` in N/mm², `I`, `J` in mm⁴, `Cw` in mm
 `kϕ` in N/rad, `q` in N/mm (= kN/m), `θ` in rad.
 
 ```julia
-using PlautBeamFiniteElement: Section, Material, Restraint, BeamModel, solve_beam,
+using PlautBeamElement: Section, Material, Restraint, BeamModel, solve_beam,
                               twist, lateral_deflection, deflections, element_end_forces
 
 # Example 1 of the paper: 9CS2.5×059 C-section stud, L = 7620 mm

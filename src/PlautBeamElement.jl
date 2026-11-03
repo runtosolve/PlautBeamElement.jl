@@ -1,5 +1,5 @@
 """
-    PlautBeamFiniteElement
+    PlautBeamElement
 
 Finite element implementation of the lateral-torsional deformation equations for
 single-span and two-span thin-walled beams with continuous bracing from:
@@ -31,16 +31,17 @@ moved to the left-hand side and assembled as a geometric (load) stiffness matrix
 
     Kg[ϕϕ] = ∫ (qx(z) ax - qy(z) ay) Nᵀ N dz
 
-so the discrete equilibrium is  [Ke + Kg(q)] d = F(q), solved here with
-NonlinearSolve.jl via the residual R(d) = [Ke + Kg(q)] d - F(q).
+so the discrete equilibrium is  [Ke + Kg(q)] d = F(q). Kg depends on the load q
+but not on the displacements d, so for a given load this is a linear system and
+is solved directly (LU factorization of the reduced stiffness). The
+load-deformation response is nonlinear in q only because Kg changes with q.
 
 Consistent units are expected, e.g. N and mm: E, G in N/mm², I in mm⁴, J in mm⁴,
 Cw in mm⁶, kx in N/mm², kϕ in N/rad (= N·mm/rad per mm), q in N/mm (= kN/m).
 """
-module PlautBeamFiniteElement
+module PlautBeamElement
 
 using LinearAlgebra
-using NonlinearSolve
 
 # ------------------------------------------------------------------
 # Input types
@@ -468,16 +469,26 @@ struct BeamSolution
 end
 
 """
-    solve_beam(model; geometric=true, abstol=1e-9)
+    solve_beam(model; geometric=true)
 
-Assemble K = Ke + Kg(q) and F(q) and solve the equilibrium residual
-R(d) = K d - F with NonlinearSolve.jl (Newton-Raphson). The residual is
-equilibrated row-by-row by the stiffness diagonal so the convergence tolerance is
-dimensionless and insensitive to the (very different) scales of the translational,
-rotational, and warping equations. Pass `geometric=false` to drop the geometric
-(load) stiffness and recover the load-independent linear stiffness solution.
+Assemble K = Ke + Kg(q) and F(q) and solve the linear equilibrium system
+K d = F for the free DOFs. Kg depends on the load but not on the displacements,
+so no iteration is needed.
+
+The reduced stiffness is factored by LU decomposition. An error is thrown if it
+is singular -- the load is exactly at a critical level, or the supports do not
+prevent rigid-body motion. Note that K is positive definite only below the first
+critical load; above it K is indefinite but generally nonsingular, and a
+solution is still returned (the uncoupled vertical deflection remains valid, but
+the twist and lateral fields describe an unstable equilibrium).
+
+`residual_norm` in the returned [`BeamSolution`](@ref) is the norm of the
+residual K d - F equilibrated row-by-row by the stiffness diagonal (dimensionless,
+insensitive to the very different scales of the translational, rotational, and
+warping equations). Pass `geometric=false` to drop the geometric (load)
+stiffness and recover the load-independent linear stiffness solution.
 """
-function solve_beam(m::BeamModel; geometric::Bool = true, abstol = 1e-9)
+function solve_beam(m::BeamModel; geometric::Bool = true)
     K = elastic_stiffness(m)
     geometric && (K .+= geometric_stiffness(m))
     F = load_vector(m)
@@ -485,19 +496,17 @@ function solve_beam(m::BeamModel; geometric::Bool = true, abstol = 1e-9)
     free = setdiff(1:ndofs(m), constrained_dofs(m))
     Kf = K[free, free]
     Ff = F[free]
+
+    C = lu(Kf; check = false)
+    issuccess(C) ||
+        error("stiffness matrix K = Ke + Kg(q) is singular; the load may be at a critical " *
+              "level, or the supports do not prevent rigid-body motion")
+    df = C \ Ff
+
     scale = max.(abs.(diag(Kf)), eps())
-
-    residual(d, p) = (p.K * d - p.F) ./ p.s
-    p = (K = Kf, F = Ff, s = scale)
-    prob = NonlinearProblem(residual, zeros(length(free)), p)
-    sol = solve(prob, NewtonRaphson(); abstol = abstol)
-    SciMLBase.successful_retcode(sol) ||
-        error("NonlinearSolve did not converge (retcode $(sol.retcode)); " *
-              "the load may be at or beyond the critical (singular-stiffness) level")
-
     d = zeros(ndofs(m))
-    d[free] = sol.u
-    return BeamSolution(m, d, norm(residual(sol.u, p)), geometric)
+    d[free] = df
+    return BeamSolution(m, d, norm((Kf * df - Ff) ./ scale), geometric)
 end
 
 # ------------------------------------------------------------------
@@ -600,4 +609,4 @@ function element_end_forces(sol::BeamSolution)
     end
 end
 
-end # module PlautBeamFiniteElement
+end # module PlautBeamElement

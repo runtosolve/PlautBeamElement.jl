@@ -1,15 +1,13 @@
-name = "PlautBeamFiniteElement"
-uuid = "8e77ad14-ffa2-4383-ba63-9109f971d658"
-version = "0.3.1"
+name = "PlautBeamElement"
+uuid = "1ae087d9-73e4-4680-9675-1d6b63e7ecef"
+version = "0.4.0"
 authors = ["Cris Moen <cris.moen@runtosolve.com>"]
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
 
 [compat]
 LinearAlgebra = "1"
-NonlinearSolve = "3, 4"
 julia = "1.10"
 
 [extras]
