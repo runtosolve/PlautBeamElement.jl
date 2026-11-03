@@ -531,7 +531,7 @@ end
     @test sol.residual_norm < 1e-8
 end
 
-@testset "sparse direct solve ≡ Newton-Raphson solve" begin
+@testset "sparse assembly ≡ dense assembly" begin
     r = Restraint(kx = 0.1, kϕ = 1000.0)
     models = [
         model1(q = 1.0, restraint = r),
@@ -544,22 +544,23 @@ end
     for m in models
         @test sparse_stiffness(m) ≈ elastic_stiffness(m) + geometric_stiffness(m)
         @test sparse_stiffness(m; geometric = false) ≈ elastic_stiffness(m)
+        F = load_vector(m)
+        free = setdiff(1:size(F, 1), constrained_dofs(m))
         for geometric in (true, false)
-            sn = solve_beam(m; geometric)
-            sl = solve_beam_linear(m; geometric)
-            @test sl isa BeamSolution
-            @test sl.geometric == geometric
-            @test sl.residual_norm < 1e-8
-            @test sl.d ≈ sn.d rtol = 1e-7
-            fn, fl = element_end_forces(sn), element_end_forces(sl)
-            @test [f.end1.Mx for f in fl] ≈ [f.end1.Mx for f in fn] rtol = 1e-6
-            @test [f.end2.T for f in fl] ≈ [f.end2.T for f in fn] rtol = 1e-6
+            K = geometric ? elastic_stiffness(m) + geometric_stiffness(m) : elastic_stiffness(m)
+            ddense = K[free, free] \ F[free]               # dense reference solve
+            s = solve_beam(m; geometric)
+            @test s isa BeamSolution
+            @test s.geometric == geometric
+            @test s.residual_norm < 1e-8
+            @test s.d[free] ≈ ddense rtol = 1e-9
+            @test solve_beam_linear(m; geometric).d == s.d   # alias
         end
     end
     # a mesh whose dense stiffness would need ~2.5 GB solves in sparse storage
     big = BeamModel(L = 10L, nel = 3000, section = sec2, material = mat, restraint = r, q = 1.0,
                     interior_supports = [5L])
-    @test solve_beam_linear(big).residual_norm < 1e-8
+    @test solve_beam(big).residual_norm < 1e-8
 end
 
 end

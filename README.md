@@ -30,8 +30,10 @@ and warping `ϕ'`.
   softening for gravity load applied above the shear center, stiffening for uplift.
   This is what makes the load–twist curves of the paper's Figs. 3–16 nonlinear.
 * **Solution**: `Kg` depends on the load `q` but not on the displacements, so for a
-  given load `[Ke + Kg(q)] d = F(q)` is a linear system, solved directly by LU
-  factorization of the reduced stiffness (an error is raised if it is singular).
+  given load `[Ke + Kg(q)] d = F(q)` is a linear system. `K` is assembled in sparse
+  storage (`sparse_stiffness(model)`) and solved with one sparse LU factorization, so
+  memory and run time grow linearly with the mesh (an error is raised if `K` is
+  singular).
   The load–deformation curves are nonlinear in `q` only because `Kg` scales with `q`.
 
 Boundary conditions follow the paper: `:pinned` (`u = v = ϕ = 0`, free to warp) and

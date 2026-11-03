@@ -33,7 +33,7 @@ moved to the left-hand side and assembled as a geometric (load) stiffness matrix
 
 so the discrete equilibrium is  [Ke + Kg(q)] d = F(q). Kg depends on the load q
 but not on the displacements d, so for a given load this is a linear system and
-is solved directly with a sparse factorization ([`solve_beam_linear`](@ref)). The
+is solved directly with a sparse factorization ([`solve_beam`](@ref)). The
 load-deformation response is nonlinear in q only because Kg changes with q.
 
 Consistent units are expected, e.g. N and mm: E, G in N/mm², I in mm⁴, J in mm⁴,
@@ -470,51 +470,6 @@ struct BeamSolution
 end
 
 """
-    solve_beam(model; geometric=true)
-
-Assemble K = Ke + Kg(q) and F(q) and solve the linear equilibrium system
-K d = F for the free DOFs. Kg depends on the load but not on the displacements,
-so no iteration is needed.
-
-The reduced stiffness is factored by LU decomposition. An error is thrown if it
-is singular -- the load is exactly at a critical level, or the supports do not
-prevent rigid-body motion. Note that K is positive definite only below the first
-critical load; above it K is indefinite but generally nonsingular, and a
-solution is still returned (the uncoupled vertical deflection remains valid, but
-the twist and lateral fields describe an unstable equilibrium).
-
-`residual_norm` in the returned [`BeamSolution`](@ref) is the norm of the
-residual K d - F equilibrated row-by-row by the stiffness diagonal (dimensionless,
-insensitive to the very different scales of the translational, rotational, and
-warping equations). Pass `geometric=false` to drop the geometric (load)
-stiffness and recover the load-independent linear stiffness solution.
-"""
-function solve_beam(m::BeamModel; geometric::Bool = true)
-    K = elastic_stiffness(m)
-    geometric && (K .+= geometric_stiffness(m))
-    F = load_vector(m)
-
-    free = setdiff(1:ndofs(m), constrained_dofs(m))
-    Kf = K[free, free]
-    Ff = F[free]
-
-    C = lu(Kf; check = false)
-    issuccess(C) ||
-        error("stiffness matrix K = Ke + Kg(q) is singular; the load may be at a critical " *
-              "level, or the supports do not prevent rigid-body motion")
-    df = C \ Ff
-
-    scale = max.(abs.(diag(Kf)), eps())
-    d = zeros(ndofs(m))
-    d[free] = df
-    return BeamSolution(m, d, norm((Kf * df - Ff) ./ scale), geometric)
-end
-
-# ------------------------------------------------------------------
-# Sparse assembly and direct linear solution
-# ------------------------------------------------------------------
-
-"""
     sparse_stiffness(model; geometric=true)
 
 Global stiffness K = Ke + Kg(q) (or Ke alone with `geometric=false`) assembled as a
@@ -543,17 +498,28 @@ function sparse_stiffness(m::BeamModel; geometric::Bool = true)
 end
 
 """
-    solve_beam_linear(model; geometric=true)
+    solve_beam(model; geometric=true)
 
-Same equilibrium as [`solve_beam`](@ref), [Ke + Kg(q)] d = F(q), solved directly
-with one sparse LU factorization instead of Newton-Raphson. Kg depends on the
-load q but not on the displacements d, so the system is linear in d: Newton-
-Raphson converges in a single step to this same solution. Assembling K sparse and
-solving it directly avoids the dense matrices and the automatic-differentiation
-Jacobian, which dominate the run time and memory of `solve_beam` on fine meshes.
-`residual_norm` is the diagonally scaled residual used by `solve_beam`.
+Assemble K = Ke + Kg(q) in sparse storage ([`sparse_stiffness`](@ref)) and F(q),
+and solve the linear equilibrium system K d = F for the free DOFs with one sparse
+LU factorization. Kg depends on the load but not on the displacements, so no
+iteration is needed. Sparse storage keeps memory and run time linear in the
+number of elements, so fine meshes (thousands of elements) are inexpensive.
+
+An error is thrown if the reduced stiffness is singular -- the load is exactly at
+a critical level, or the supports do not prevent rigid-body motion. K is positive
+definite only below the first critical load; above it K is indefinite but
+generally nonsingular, and a solution is still returned (the uncoupled vertical
+deflection remains valid, but the twist and lateral fields describe an unstable
+equilibrium).
+
+`residual_norm` in the returned [`BeamSolution`](@ref) is the norm of the
+residual K d - F equilibrated row-by-row by the stiffness diagonal (dimensionless,
+insensitive to the very different scales of the translational, rotational, and
+warping equations). Pass `geometric=false` to drop the geometric (load)
+stiffness and recover the load-independent linear stiffness solution.
 """
-function solve_beam_linear(m::BeamModel; geometric::Bool = true)
+function solve_beam(m::BeamModel; geometric::Bool = true)
     K = sparse_stiffness(m; geometric)
     F = load_vector(m)
 
@@ -561,16 +527,25 @@ function solve_beam_linear(m::BeamModel; geometric::Bool = true)
     Kf = K[free, free]
     Ff = F[free]
 
-    factorization = lu(Kf; check = false)
-    issuccess(factorization) ||
-        error("singular stiffness matrix; the load may be at the critical (singular-stiffness) level")
-    df = factorization \ Ff
+    C = lu(Kf; check = false)
+    issuccess(C) ||
+        error("stiffness matrix K = Ke + Kg(q) is singular; the load may be at a critical " *
+              "level, or the supports do not prevent rigid-body motion")
+    df = C \ Ff
 
     scale = max.(abs.(diag(Kf)), eps())
     d = zeros(ndofs(m))
     d[free] = df
     return BeamSolution(m, d, norm((Kf * df - Ff) ./ scale), geometric)
 end
+
+"""
+    solve_beam_linear(model; geometric=true)
+
+Alias of [`solve_beam`](@ref), kept for code written when the sparse direct solve
+was a separate function alongside the former Newton-Raphson `solve_beam`.
+"""
+solve_beam_linear(m::BeamModel; geometric::Bool = true) = solve_beam(m; geometric)
 
 # ------------------------------------------------------------------
 # Field evaluation
