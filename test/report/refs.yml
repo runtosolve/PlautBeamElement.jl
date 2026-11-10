@@ -1,0 +1,12 @@
+plaut2021:
+  type: article
+  title: Lateral-torsional deformations of single-span and two-span thin-walled beams with continuous bracing
+  author: [Plaut, Raymond H., Moen, Cristopher D.]
+  date: 2021
+  page-range: 106534
+  serial-number:
+    doi: 10.1016/j.jcsr.2021.106534
+  parent:
+    type: periodical
+    title: Journal of Constructional Steel Research
+    volume: 179
