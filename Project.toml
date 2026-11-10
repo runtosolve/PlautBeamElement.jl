@@ -1,6 +1,6 @@
 name = "PlautBeamElement"
 uuid = "1ae087d9-73e4-4680-9675-1d6b63e7ecef"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Cris Moen <cris.moen@runtosolve.com>"]
 
 [deps]

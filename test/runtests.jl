@@ -2,7 +2,8 @@ using PlautBeamElement: Section, Material, Restraint, BeamModel, BeamSolution,
                               elastic_stiffness, geometric_stiffness, load_vector,
                               constrained_dofs, solve_beam, solve_beam_linear, sparse_stiffness,
                               deflections, twist,
-                              lateral_deflection, vertical_deflection, element_end_forces
+                              lateral_deflection, vertical_deflection, element_end_forces,
+                              critical_load, prebuckling_moments
 using Test
 using LinearAlgebra
 
@@ -47,8 +48,13 @@ function series_solution(z; L, section, material, restraint, q, θ = 0.0, nmodes
     return (u = u, v = v, ϕ = ϕ)
 end
 
-model1(; kwargs...) = BeamModel(; L, nel = 40, section = sec1, material = mat, kwargs...)
-model2(; kwargs...) = BeamModel(; L, nel = 40, section = sec2, material = mat, kwargs...)
+# The paper-reference testsets below check Eqs. (2)-(4) exactly, i.e. the geometric
+# stiffness with the load-height term only, so these helpers turn the moment
+# coupling off; the "moment coupling" testsets at the end turn it on.
+model1(; moment_coupling = false, kwargs...) =
+    BeamModel(; L, nel = 40, section = sec1, material = mat, moment_coupling, kwargs...)
+model2(; moment_coupling = false, kwargs...) =
+    BeamModel(; L, nel = 40, section = sec2, material = mat, moment_coupling, kwargs...)
 
 peak_abs_twist(sol; npts = 401) = maximum(abs, twist.(Ref(sol), range(0, sol.model.L, npts)))
 
@@ -185,10 +191,11 @@ end
     # A symmetric two-span beam with a central support behaves like two
     # pinned-fixed beams with the fixed end at the central support.
     r = Restraint(kx = 0.1, kϕ = 1000.0)
+    for coupling in (false, true)
     two = BeamModel(L = 2L, nel = 80, section = sec1, material = mat,
-                    restraint = r, q = 1.0, interior_supports = [L])
+                    restraint = r, q = 1.0, interior_supports = [L], moment_coupling = coupling)
     sol2 = solve_beam(two)
-    solpf = solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed))
+    solpf = solve_beam(model1(q = 1.0, restraint = r, bc_right = :fixed, moment_coupling = coupling))
     for z in (0.2L, 0.42L, 0.6L, 0.8L)
         @test twist(sol2, z) ≈ twist(solpf, z) rtol = 1e-8 atol = 1e-12
         @test lateral_deflection(sol2, z) ≈ lateral_deflection(solpf, z) rtol = 1e-8
@@ -198,6 +205,7 @@ end
     end
     # warping/twist rotation continuity at the central support: ϕ'(L) = 0 by symmetry
     @test twist(sol2, L - 1.0) ≈ twist(sol2, L + 1.0) rtol = 1e-6 atol = 1e-12
+    end
 end
 
 @testset "geometric stiffness: load-deformation nonlinearity (Figs. 3-4)" begin
@@ -238,7 +246,8 @@ end
 @testset "mesh convergence" begin
     r = Restraint(kx = 0.1, kϕ = 1000.0)
     ϕ = [twist(solve_beam(BeamModel(L = L, nel = n, section = sec2, material = mat,
-                                    restraint = r, q = 3.0, bc_right = :fixed)), 0.42L)
+                                    restraint = r, q = 3.0, bc_right = :fixed,
+                                    moment_coupling = false)), 0.42L)
          for n in (8, 16, 32, 64)]
     err = abs.(ϕ[1:3] .- ϕ[4])
     @test err[2] < err[1] && err[3] < err[2]
@@ -306,7 +315,7 @@ end
              (section = sec2, restraint = Restraint(kx = 0.1, kϕ = 1000.0), q = 3.0)]
     for c in cases
         m = BeamModel(L = L, nel = 40, section = c.section, material = mat,
-                      restraint = c.restraint, q = c.q)
+                      restraint = c.restraint, q = c.q, moment_coupling = false)
         f = element_end_forces(solve_beam(m))
         for e in (11, 21)                                     # z = 0.25L, 0.5L
             z = f[e].end1.z
@@ -540,6 +549,9 @@ end
         model2(q = (0.5, 1.5), restraint = r),
         BeamModel(L = 2L, nel = 80, section = sec2, material = mat, restraint = r,
                   q = [1.0, (1.0, 2.0)], interior_supports = [L]),
+        model1(q = -1.0, restraint = r, θ = 0.1, moment_coupling = true),
+        model2(q = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1500.0), bc_right = :fixed,
+               moment_coupling = true),
     ]
     for m in models
         @test sparse_stiffness(m) ≈ elastic_stiffness(m) + geometric_stiffness(m)
@@ -561,6 +573,188 @@ end
     big = BeamModel(L = 10L, nel = 3000, section = sec2, material = mat, restraint = r, q = 1.0,
                     interior_supports = [5L])
     @test solve_beam(big).residual_norm < 1e-8
+end
+
+# ==================================================================
+# Moment coupling: twist ↔ bending terms -(Mx ϕ)'', (My ϕ)'', -Mx u'', My v''
+# ==================================================================
+
+@testset "moment coupling: geometric stiffness properties" begin
+    r = Restraint(kx = 0.1, kϕ = 1000.0)
+    @test BeamModel(L = L, nel = 4, section = sec2, material = mat, q = 1.0).moment_coupling
+    for m in (model2(q = 1.0, moment_coupling = true),
+              model1(q = 1.0, restraint = r, θ = 0.2, moment_coupling = true),
+              BeamModel(L = 2L, nel = 80, section = sec2, material = mat, restraint = r,
+                        q = [1.0, (1.0, 2.0)], interior_supports = [L]))
+        Kg = geometric_stiffness(m)
+        @test Kg ≈ Kg' atol = 1e-12 * maximum(abs, Kg)
+        # couples u and v to ϕ (rows/cols 1,3 vs 5 of each node), unlike load height alone
+        @test maximum(abs, Kg[1:6:end, 5:6:end]) > 0
+        @test iszero(geometric_stiffness(BeamModel(L = m.L, nel = m.nel, section = m.section,
+                                                   material = m.material, restraint = m.restraint,
+                                                   q = 1.0, moment_coupling = false))[1:6:end, 5:6:end])
+    end
+    # Kg is proportional to the load (moments are first-order), so q_cr is one eigenvalue
+    m1 = model2(q = 1.0, restraint = r, moment_coupling = true)
+    m2 = model2(q = 2.0, restraint = r, moment_coupling = true)
+    @test geometric_stiffness(m2) ≈ 2 * geometric_stiffness(m1) rtol = 1e-10
+    @test critical_load(m2) ≈ critical_load(m1) / 2 rtol = 1e-8
+    @test iszero(geometric_stiffness(model2(q = 0.0, moment_coupling = true)))
+end
+
+@testset "moment coupling: pre-buckling moments" begin
+    # single span: Mx = -q z (L - z)/2 (sagging negative), My = 0 without lateral load
+    m = model2(q = 1.0, moment_coupling = true)
+    M = prebuckling_moments(m)
+    Le = L / m.nel
+    for e in (1, 10, 20)
+        z1, z2 = (e - 1) * Le, e * Le
+        @test M[e].Mx1 ≈ -z1 * (L - z1) / 2 atol = 1e-6 * L^2
+        @test M[e].Mx2 ≈ -z2 * (L - z2) / 2 atol = 1e-6 * L^2
+        @test abs(M[e].My1) < 1e-8 * L^2
+    end
+    @test prebuckling_moments(model2(q = 1.0)) === nothing        # helper default: off
+    # two equal spans: hogging moment qL²/8 over the central support (three-moment theorem)
+    two = BeamModel(L = 2L, nel = 80, section = sec1, material = mat, q = 1.0,
+                    interior_supports = [L])
+    M2 = prebuckling_moments(two)
+    @test M2[40].Mx2 ≈ L^2 / 8 rtol = 1e-8
+    @test M2[41].Mx1 ≈ L^2 / 8 rtol = 1e-8
+end
+
+@testset "moment coupling: classical LTB of a doubly symmetric I-beam" begin
+    # uniform load at the shear center, fork supports: q_cr L²/8 = C1 Mcr, C1 ≈ 1.13
+    E, G = 200e3, 200e3 / 2.6
+    Iy, J, Cw = 2.0e6, 1.0e5, 1.0e11
+    Mcr = π / L * sqrt(E * Iy * G * J * (1 + π^2 * E * Cw / (G * J * L^2)))
+    mk(ay) = BeamModel(L = L, nel = 60, section = Section(Ix = 50e6, Iy = Iy, J = J, Cw = Cw,
+                       ax = 0.0, ay = ay), material = Material(E = E, G = G), q = 1.0)
+    C1 = critical_load(mk(0.0)) * L^2 / 8 / Mcr
+    @test 1.12 < C1 < 1.14
+    # load above the shear center lowers q_cr, below raises it
+    @test critical_load(mk(150.0)) < critical_load(mk(0.0)) < critical_load(mk(-150.0))
+    # without the coupling there is no buckling for a load at the shear center
+    @test critical_load(BeamModel(L = L, nel = 60, section = Section(Ix = 50e6, Iy = Iy, J = J,
+                        Cw = Cw, ax = 0.0, ay = 0.0), material = Material(E = E, G = G), q = 1.0,
+                        moment_coupling = false)) == Inf
+end
+
+@testset "moment coupling: critical load without coupling matches closed form" begin
+    λ1 = π / L
+    qcr = (mat.E * sec1.Cw * λ1^4 + mat.G * sec1.J * λ1^2) / sec1.ay
+    @test critical_load(model1(q = 1.0)) ≈ qcr rtol = 1e-5
+end
+
+@testset "moment coupling vs spectral Galerkin reference" begin
+    # Independent sine-series Galerkin solution of the coupled equations for a
+    # pinned-pinned beam under uniform gravity load (qx = 0). Mx(z) = -q z (L - z)/2 from
+    # statics; My(z) = E (Iy u'' + Ixy v'') from the reference's own first-order solution
+    # (nonzero with bracing, whose reactions bend the beam laterally). With
+    # u, v, ϕ = Σ (aₘ, cₘ, bₘ) sₘ the coupling energy ∫ (-Mx ϕ u'' + My ϕ v'') dz is
+    # Σ aₘ bₙ λₘ² ∫ Mx sₘ sₙ dz - Σ cₘ bₙ λₘ² ∫ My sₘ sₙ dz.
+    function galerkin(section, restraint, q; N = 60)
+        (; E, G) = mat
+        (; Ix, Iy, Ixy, J, Cw, ax, ay) = section
+        (; kx, kϕ) = restraint
+        nz = 6000                                            # composite Simpson
+        zs = range(0, L, nz + 1)
+        wz = [(i == 0 || i == nz) ? 1.0 : (isodd(i) ? 4.0 : 2.0) for i in 0:nz] .* (step(zs) / 3)
+        Mx = -q .* zs .* (L .- zs) ./ 2
+        S = [sin(m * π * z / L) for z in zs, m in 1:N]
+        K = zeros(3N, 3N); F = zeros(3N)
+        iu(m) = 3m - 2; iv(m) = 3m - 1; iϕ(m) = 3m
+        for m in 1:N
+            λ = m * π / L
+            K[iu(m), iu(m)] = (E * Iy * λ^4 + kx) * L / 2
+            K[iu(m), iv(m)] = K[iv(m), iu(m)] = E * Ixy * λ^4 * L / 2
+            K[iv(m), iv(m)] = E * Ix * λ^4 * L / 2
+            K[iu(m), iϕ(m)] = K[iϕ(m), iu(m)] = kx * ay * L / 2
+            K[iϕ(m), iϕ(m)] = (E * Cw * λ^4 + G * J * λ^2 + kx * ay^2 + kϕ) * L / 2
+            c = isodd(m) ? 2L / (m * π) : 0.0                # ∫ sₘ dz
+            F[iv(m)] = q * c
+            F[iϕ(m)] = q * ax * c
+        end
+        x0 = K \ F                                           # first order
+        My = -E .* (S * [(Iy * x0[iu(m)] + Ixy * x0[iv(m)]) * (m * π / L)^2 for m in 1:N])
+        K[diagind(K)[3:3:end]] .-= q * ay * L / 2             # load height
+        for m in 1:N, n in 1:N
+            Cx = (m * π / L)^2 * sum(wz .* Mx .* S[:, m] .* S[:, n])
+            Cy = -(m * π / L)^2 * sum(wz .* My .* S[:, m] .* S[:, n])
+            K[iu(m), iϕ(n)] += Cx; K[iϕ(n), iu(m)] += Cx
+            K[iv(m), iϕ(n)] += Cy; K[iϕ(n), iv(m)] += Cy
+        end
+        x = K \ F
+        field(z, off) = sum(x[3m - off] * sin(m * π * z / L) for m in 1:N)
+        return (u = z -> field(z, 2), v = z -> field(z, 1), ϕ = z -> field(z, 0))
+    end
+    # loads ≈ 0.4 q_cr (coupled q_cr ≈ 0.117, 3.53, 0.776 N/mm respectively)
+    cases = [(section = sec2, restraint = Restraint(), q = 0.05),                    # unbraced Z
+             (section = sec2, restraint = Restraint(kx = 0.1, kϕ = 1000.0), q = 1.5), # braced Z
+             (section = sec1, restraint = Restraint(kϕ = 500.0), q = 0.3)]          # C-section
+    for c in cases
+        ref = galerkin(c.section, c.restraint, c.q)
+        sol = solve_beam(BeamModel(L = L, nel = 60, section = c.section, material = mat,
+                                   restraint = c.restraint, q = c.q))
+        for z in (0.25L, 0.5L)
+            @test twist(sol, z) ≈ ref.ϕ(z) rtol = 1e-3
+            @test lateral_deflection(sol, z) ≈ ref.u(z) rtol = 1e-3 atol = 1e-9
+            @test vertical_deflection(sol, z) ≈ ref.v(z) rtol = 1e-3
+        end
+    end
+end
+
+@testset "moment coupling: Z8x2.5 vs Abaqus shell model (sign check)" begin
+    # Three-way validation (rev. 29 Oct 2026): Z8x2.5 16 ga, 300 in, pinned, unbraced,
+    # gravity on the top flange; kip, in. Abaqus S4R shell: q_cr = 11.2 lb/ft.
+    secZ = Section(Ix = 8.434, Iy = 1.466, Ixy = -2.563, J = 0.001050, Cw = 16.76,
+                   ax = 1.2793, ay = 3.97)
+    plf = 1 / 12000
+    mk(q, c) = BeamModel(L = 300.0, nel = 60, section = secZ, material = Material(E = 29500.0),
+                         q = q * plf, moment_coupling = c)
+    @test critical_load(mk(1.0, false)) ≈ 21.9 rtol = 2e-3          # load height only
+    qcr = critical_load(mk(1.0, true))
+    @test 10.0 < qcr < 11.2                                          # within 6 % of Abaqus
+    # The coupling sign does not change q_cr (it enters squared) but it does change
+    # the response: with the right sign every midspan quantity moves toward Abaqus.
+    # Abaqus at 2.4 lb/ft in the Plaut frame: u = 0.358, v = 0.217, ϕ = 0.059.
+    on, off = solve_beam(mk(2.4, true)), solve_beam(mk(2.4, false))
+    for (f, ref) in ((lateral_deflection, 0.358), (vertical_deflection, 0.217), (twist, 0.059))
+        @test abs(f(on, 150.0) - ref) < abs(f(off, 150.0) - ref)
+    end
+end
+
+@testset "moment coupling: element end forces" begin
+    m = model2(q = 1.0, moment_coupling = true)                    # unbraced Z, pinned
+    sol = solve_beam(m)
+    f = element_end_forces(sol)                                      # fixed axes (default)
+    fs = element_end_forces(sol; axes = :section)
+    # statics about the fixed axes are unchanged by the coupling
+    @test f[1].end1.Vy ≈ L / 2 rtol = 1e-9
+    @test f[20].end2.Mx ≈ -L^2 / 8 rtol = 1e-6
+    # no lateral load: the fixed-axis My vanishes ...
+    Mmax = L^2 / 8
+    @test maximum(abs(fe.end2.My) for fe in f) < 1e-3 * Mmax
+    # ... while about the twisted section axes the strong-axis moment has a
+    # weak-axis component My ≈ Mx ϕ
+    @test fs[20].end2.My ≈ f[20].end2.Mx * twist(sol, L / 2) rtol = 2e-2
+    # fixed-axis actions are continuous between elements
+    # (My is ≈ 0 here, so its tolerance is scaled by Mx)
+    scale = Dict(a => maximum(abs, [getfield(fe.end2, a == :My ? :Mx : a) for fe in f])
+                 for a in (:My, :Mx, :T, :B))
+    for e in 1:(m.nel - 1), a in (:My, :Mx, :T, :B)
+        x2, x1 = getfield(f[e].end2, a), getfield(f[e + 1].end1, a)
+        @test isapprox(x2, x1; rtol = 1e-6, atol = 1e-8 * scale[a])
+    end
+    @test_throws ArgumentError element_end_forces(sol; axes = :principal)
+end
+
+@testset "moment coupling: mesh convergence of q_cr" begin
+    qcr = [critical_load(BeamModel(L = L, nel = n, section = sec2, material = mat, q = 1.0,
+                                   restraint = Restraint(kx = 0.01)))
+           for n in (8, 16, 32, 64)]
+    err = abs.(qcr[1:3] .- qcr[4])
+    @test err[2] < err[1] && err[3] < err[2]
+    @test err[3] / qcr[4] < 1e-4
 end
 
 end
